@@ -389,7 +389,8 @@ unsthysteria(){
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh
     iptables -t nat -F PREROUTING >/dev/null 2>&1
     netfilter-persistent save >/dev/null 2>&1
-
+    systemctl daemon-reload
+    
     green "Hysteria 2 已彻底卸载完成！"
 }
 
@@ -403,18 +404,24 @@ stophysteria(){
     systemctl disable hysteria-server >/dev/null 2>&1
 }
 
+showhysteria(){
+    systemctl status hysteria-server
+}
+
 hysteriaswitch(){
     yellow "请选择你需要的操作："
     echo ""
     echo -e " ${GREEN}1.${PLAIN} 启动 Hysteria 2"
     echo -e " ${GREEN}2.${PLAIN} 关闭 Hysteria 2"
     echo -e " ${GREEN}3.${PLAIN} 重启 Hysteria 2"
+    echo -e " ${GREEN}4.${PLAIN} 显示 Hysteria 2 服务状态"
     echo ""
-    read -rp "请输入选项 [0-3]: " switchInput
+    read -rp "请输入选项 [0-4]: " switchInput
     case $switchInput in
         1 ) starthysteria ;;
         2 ) stophysteria ;;
         3 ) stophysteria && starthysteria ;;
+        4 ) showhysteria ;;
         * ) exit 1 ;;
     esac
 }
