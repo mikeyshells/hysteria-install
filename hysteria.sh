@@ -51,25 +51,59 @@ if [[ -z $(type -P curl) ]]; then
     ${PACKAGE_INSTALL[int]} curl
 fi
 
-# 安装依赖：按发行版选择正确的包名与防火墙持久化方案
+# 安装依赖：firewalld 作为统一的防火墙管理工具
+# （firewalld 是 Rocky/RHEL 的默认防火墙，传统 iptables 服务已被官方弃用）
 install_deps(){
     if is_rhel; then
-        ${PACKAGE_INSTALL[int]} curl wget sudo openssl procps-ng iptables iptables-services
-        systemctl enable iptables ip6tables >/dev/null 2>&1
+        ${PACKAGE_INSTALL[int]} curl wget sudo openssl procps-ng firewalld
     else
         ${PACKAGE_UPDATE[int]}
-        ${PACKAGE_INSTALL[int]} curl wget sudo openssl procps iptables iptables-persistent netfilter-persistent
+        ${PACKAGE_INSTALL[int]} curl wget sudo openssl procps firewalld
     fi
+    systemctl enable --now firewalld >/dev/null 2>&1
 }
 
-# 持久化 iptables 规则：Debian 用 netfilter-persistent，RHEL 用 iptables-services
-save_iptables(){
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif is_rhel; then
-        service iptables save >/dev/null 2>&1
-        service ip6tables save >/dev/null 2>&1
-    fi
+# firewalld 辅助函数：获取默认区域
+fw_zone(){ firewall-cmd --get-default-zone 2>/dev/null; }
+
+# 重新加载 firewalld，使 --permanent 规则生效
+reload_firewall(){
+    command -v firewall-cmd >/dev/null 2>&1 || return
+    firewall-cmd --reload >/dev/null 2>&1
+}
+
+# 开放指定 UDP 端口（永久）
+open_port(){
+    local p=$1
+    [[ -z $p ]] && return
+    command -v firewall-cmd >/dev/null 2>&1 || return
+    firewall-cmd --permanent --add-port="${p}/udp" >/dev/null 2>&1
+}
+
+# 关闭指定 UDP 端口（永久）
+close_port(){
+    local p=$1
+    [[ -z $p ]] && return
+    command -v firewall-cmd >/dev/null 2>&1 || return
+    firewall-cmd --permanent --remove-port="${p}/udp" >/dev/null 2>&1
+}
+
+# 添加端口跳跃转发规则：将 UDP 范围端口转发到本机主端口
+add_forward_port(){
+    local range=$1 toport=$2
+    command -v firewall-cmd >/dev/null 2>&1 || return
+    firewall-cmd --permanent --add-forward-port=port="${range}":proto=udp:toport="${toport}" >/dev/null 2>&1
+}
+
+# 清除本脚本添加的所有端口跳跃转发规则
+clear_forward_ports(){
+    local zone rule
+    command -v firewall-cmd >/dev/null 2>&1 || return
+    zone=$(fw_zone)
+    [[ -z $zone ]] && return
+    for rule in $(firewall-cmd --permanent --zone="$zone" --list-forward-ports 2>/dev/null); do
+        firewall-cmd --permanent --zone="$zone" --remove-forward-port="$rule" >/dev/null 2>&1
+    done
 }
 
 detect_real_ip(){
@@ -189,7 +223,7 @@ inst_cert(){
 }
 
 inst_port(){
-    iptables -t nat -F PREROUTING >/dev/null 2>&1
+    clear_forward_ports
 
     read -rp "设置 Hysteria 2 端口 [1-65535]（回车则随机分配端口）：" port
     [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
@@ -200,7 +234,9 @@ inst_port(){
     done
 
     yellow "将在 Hysteria 2 节点使用的端口是：$port"
+    open_port "$port"
     inst_jump
+    reload_firewall
 }
 
 inst_jump(){
@@ -218,9 +254,7 @@ inst_jump(){
             read -rp "设置范围端口的起始端口 (建议10000-65535之间)：" firstport
             read -rp "设置范围端口的末尾端口 (建议10000-65535之间，一定要比起始端口大)：" endport
         done
-        iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
-        ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
-        save_iptables
+        add_forward_port "$firstport-$endport" "$port"
     else
         yellow "将继续使用单端口模式"
     fi
@@ -420,13 +454,16 @@ insthysteria(){
 }
 
 unsthysteria(){
+    local hyport
+    [[ -f "$HY_CONFIG" ]] && hyport=$(grep '^listen:' "$HY_CONFIG" | awk -F: '{print $NF}')
+
     systemctl stop hysteria-server.service >/dev/null 2>&1
     systemctl disable hysteria-server.service >/dev/null 2>&1
     rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria "$SELF_SIGNED_DIR"
-    iptables -t nat -F PREROUTING >/dev/null 2>&1
-    ip6tables -t nat -F PREROUTING >/dev/null 2>&1
-    save_iptables
+    clear_forward_ports
+    close_port "$hyport"
+    reload_firewall
     systemctl daemon-reload
 
     green "Hysteria 2 已彻底卸载完成！"
@@ -474,6 +511,10 @@ changeport(){
     done
 
     sed -i "s|^listen: :.*|listen: :$port|" "$HY_CONFIG"
+
+    close_port "$oldport"
+    open_port "$port"
+    reload_firewall
 
     stophysteria && starthysteria
 
